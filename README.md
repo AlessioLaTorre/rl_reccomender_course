@@ -60,9 +60,13 @@ rl_recommender_course/
 │   │   ├── Reinforce.py         # RL agent logic
 │   │   ├── pipeline.py          # Training pipeline entry point
 │   │   ├── matchings.py         # Skill-job matching utilities
-│   │   ├── tuning.py            # Hyperparameter optimization (optional, not finalized)
+│   │   ├── tuning.py            # Experimental reward-weight tuning (beta1)
 │   │   └── evaluation.py        # results visualization and evaluation
 │   │    
+│   │
+│   ├── Optimization/            # PPO and MaskablePPO hyperparameter tuning
+│   │   ├── tuning_ready.py      # Optuna tuning entry point
+│   │   └── README.md            # Tuning instructions and options
 │   │
 │   ├── config/
 │   │   └── run.yaml             # Training and inference configuration
@@ -230,8 +234,15 @@ Training outputs, logs, and models are saved according to the configuration.
 
 #### Hyperparameter Optimization
 
-Hyperparameter optimization is supported via tuning.py.
-This feature is experimental and not required for standard usage
+Optuna-based hyperparameter tuning for PPO and MaskablePPO is available in
+`UIR/Optimization/tuning_ready.py`, for the selected reward formulations and values of `k`.
+
+This is separate from the experimental `UIR/Scripts/tuning.py`, currently configured
+to optimize the reward weight `beta1`.
+
+For configuration and run instructions, see the [Optimization README](UIR/Optimization/README.md).
+
+Hyperparameter tuning is optional and is not required for standard usage.
 
 
 ---
