@@ -125,7 +125,8 @@ The Streamlit GUI is the **main entry point** for the project demo.
 Before running the demo, you must first train the required models:
 
 - **Reinforcement Learning model(s):**  
-  you need to train an RL model **for each value of `k`** you want to use for recommendation.  
+  you need to train an RL model **for each value of `k`** you want to use for recommendation. 
+  Where k denotes the number of courses the agent will recommend as a sequence 
   The training procedure is described later in the section  
   **Training a Reinforcement Learning Model**.
 

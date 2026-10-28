@@ -4,6 +4,7 @@ import argparse
 import copy
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import gymnasium as gym
@@ -190,20 +191,24 @@ class ReinforceTuner:
     """Tune one study using the same candidate for all its reward/k/seed runs."""
 
     def __init__(self, configs, dataset, output, seeds, algorithm, scope,
-                 n_trials=20, last_n=50, sampler_seed=42, pruning=False):
+                 n_trials=20, last_n=50, sampler_seed=42, pruning=False, selection=None):
         self.configs = copy.deepcopy(configs)
         self.dataset = dataset
-        self.output = Path(output)
+        self.base_output = Path(output)
+        self.output = self.base_output
         self.k_values = sorted({config["k"] for config in configs})
         self.rewards = list(dict.fromkeys(config["name_exp"] for config in configs))
         self.seeds = {k: list(seeds[k]) for k in self.k_values}
         if len({tuple(values) for values in self.seeds.values()}) != 1:
             raise ValueError("Use the same seeds, in the same order, for every k.")
         self.algorithm, self.scope = algorithm, scope
+        self.selection = copy.deepcopy(selection) if selection is not None else {
+            "algorithms": [algorithm], "rewards": self.rewards, "k_values": self.k_values,
+        }
         self.n_trials, self.last_n = n_trials, last_n
         self.sampler_seed, self.pruning = sampler_seed, pruning
-        if scope in {"reward-k", "k"}:
-            group = self.rewards[0] if scope == "reward-k" else "shared"
+        if scope == "reward-k":
+            group = self.rewards[0]
             self.study_name = f"{algorithm}_{scope}_{group}_k{self.k_values[0]}"
         else:
             group = self.rewards[0] if scope == "reward" else "shared"
@@ -230,6 +235,9 @@ class ReinforceTuner:
         folder.mkdir(parents=True, exist_ok=True)
         with (folder / f"{prefix}.yaml").open("w", encoding="utf-8") as file:
             yaml.safe_dump(config, file, sort_keys=False)
+        recovered = self.reuse_completed_run(trial, config, folder, prefix)
+        if recovered is not None:
+            return recovered
         status_path = folder / f"{prefix}.json"
         status = {"status": "running"}
         write_json(status_path, status)
@@ -253,6 +261,37 @@ class ReinforceTuner:
             if recommender is not None:
                 recommender.train_env.close()
                 recommender.eval_env.close()
+
+    def reuse_completed_run(self, trial, config, folder, prefix):
+        """Recover a completed seed from earlier attempts of this candidate."""
+        previous = trial.user_attrs.get("restart_of")
+        if previous is None:
+            return None
+        attempts = {item.number: item for item in trial.study.get_trials(deepcopy=False)}
+        visited = set()
+        while previous in attempts and previous not in visited:
+            visited.add(previous)
+            source = (self.output / f"trial{previous}" / f"results_k{config['k']}"
+                      / f"seed{config['seed']}" / prefix)
+            try:
+                status = json.loads(source.with_suffix(".json").read_text(encoding="utf-8"))
+                saved = yaml.safe_load(source.with_suffix(".yaml").read_text(encoding="utf-8"))
+                expected = {key: value for key, value in config.items() if key != "results_path"}
+                actual = {key: value for key, value in saved.items() if key != "results_path"}
+                if status.get("status") == "completed" and actual == expected:
+                    score = score_log(source.with_suffix(".txt"), config, self.last_n)
+                    shutil.copy2(source.with_suffix(".txt"), folder / f"{prefix}.txt")
+                    write_json(folder / f"{prefix}.json", {
+                        "status": "completed", "score": score,
+                        "actual_steps": status.get("actual_steps"),
+                        "reused_from": str(source.with_suffix(".txt").relative_to(self.output)),
+                    })
+                    print(f"[RESUME] {prefix}: completed run recovered from trial {previous}.", flush=True)
+                    return score
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError):
+                pass
+            previous = attempts[previous].user_attrs.get("restart_of")
+        return None
 
     def objective(self, trial) -> float:
         hypers = self.sample_hypers(trial)
@@ -351,7 +390,40 @@ class ReinforceTuner:
         return result
 
     def tune(self):
+        settings = {
+            "configs": self.configs, "data": dataset_details(self.dataset),
+            "seeds": {str(k): values for k, values in self.seeds.items()},
+            "algorithm": self.algorithm, "scope": self.scope, "version": 4,
+            "selection": self.selection,
+            "last_n": self.last_n, "sampler_seed": self.sampler_seed, "pruning": self.pruning,
+            "search_space": SEARCH_SPACE, "objective": "equal mean of per-pair mean tail jobs",
+            "project_code": {name: hashlib.sha256((PROJECT_ROOT / "UIR/Scripts" / name).read_bytes()).hexdigest()
+                             for name in ["Dataset.py", "CourseRecEnv.py", "Reinforce.py"]},
+        }
+        # The same experiment resumes; changed settings get a separate directory.
+        # The trial target is excluded so --trials can extend an existing search.
+        serialized = json.dumps(settings, sort_keys=True, allow_nan=False)
+        settings = json.loads(serialized)
+        experiment_id = hashlib.sha256(serialized.encode()).hexdigest()[:16]
+        self.output = self.base_output / f"run_{experiment_id}"
+        # Keep compatible studies created before the automatic directory layout.
+        existing_database = self.base_output / "optuna.sqlite3"
+        if existing_database.is_file():
+            try:
+                existing = optuna.load_study(
+                    study_name=self.study_name,
+                    storage=f"sqlite:///{existing_database.resolve().as_posix()}")
+                saved_settings = existing.user_attrs.get("settings")
+            except KeyError:
+                saved_settings = None
+            if isinstance(saved_settings, dict):
+                saved_settings = dict(saved_settings)
+                saved_settings.setdefault("selection", self.selection)
+                if saved_settings == settings:
+                    self.output = self.base_output
+                    print("[RESUME] Compatible study found in the existing directory.", flush=True)
         self.output.mkdir(parents=True, exist_ok=True)
+        print(f"[OUTPUT] {self.output}", flush=True)
         study = optuna.create_study(
             direction="maximize", study_name=self.study_name,
             storage=f"sqlite:///{(self.output / 'optuna.sqlite3').resolve().as_posix()}",
@@ -359,16 +431,12 @@ class ReinforceTuner:
             pruner=optuna.pruners.SuccessiveHalvingPruner(min_resource=2, reduction_factor=2)
             if self.pruning else optuna.pruners.NopPruner(), load_if_exists=True,
         )
-        settings = {
-            "configs": self.configs, "data": dataset_details(self.dataset),
-            "seeds": {str(k): values for k, values in self.seeds.items()},
-            "algorithm": self.algorithm, "scope": self.scope, "version": 4,
-            "last_n": self.last_n, "sampler_seed": self.sampler_seed, "pruning": self.pruning,
-            "search_space": SEARCH_SPACE, "objective": "equal mean of per-pair mean tail jobs",
-            "project_code": {name: hashlib.sha256((PROJECT_ROOT / "UIR/Scripts" / name).read_bytes()).hexdigest()
-                             for name in ["Dataset.py", "CourseRecEnv.py", "Reinforce.py"]},
-        }
         previous = study.user_attrs.get("settings")
+        if isinstance(previous, dict) and "selection" not in previous:
+            compatible = {**previous, "selection": self.selection}
+            if compatible == settings:
+                study.set_user_attr("settings", settings)
+                previous = settings
         if previous is not None and previous != settings:
             raise ValueError(f"Settings or project code changed for {self.study_name}. Use a new --output.")
         if previous is None and study.trials:
@@ -377,6 +445,8 @@ class ReinforceTuner:
         if previous is None:
             study.set_user_attr("settings", settings)
             self.enqueue_config(study)
+        write_json(self.output / "experiment.json", settings)
+        write_json(self.output / "dataset.json", settings["data"])
         restarted = {trial.user_attrs.get("restart_of") for trial in study.trials}
         for trial in study.trials:
             interrupted = trial.state == TrialState.RUNNING or (
@@ -385,7 +455,7 @@ class ReinforceTuner:
                 if trial.state == TrialState.RUNNING:
                     study.tell(trial.number, state=TrialState.FAIL)
                 study.enqueue_trial(trial.params, user_attrs={"restart_of": trial.number})
-                print(f"[RESTART] Trial {trial.number}: same parameters, from the first run.")
+                print(f"[RESTART] Trial {trial.number}: same parameters; completed seed logs will be recovered.")
         finished = sum(trial.state in {TrialState.COMPLETE, TrialState.PRUNED}
                        for trial in study.trials)
         remaining = max(0, self.n_trials - finished)
@@ -406,18 +476,17 @@ def save_summary(output: Path, scope: str) -> None:
     """Collect the best results already available for this algorithm and scope."""
     rows = []
     for folder, _ in make_groups(list(REWARDS), K_VALUES, scope):
-        path = output / folder / "best_params.json"
-        if not path.is_file():
-            continue
-        result = json.loads(path.read_text(encoding="utf-8"))
-        if result.get("schema") != 4:
-            continue
-        rows.append({"algorithm": result["algorithm"], "scope": scope, "study": result["study"],
-                     "rewards": ", ".join(result["rewards"]),
-                     "k_values": ",".join(map(str, result["k_values"])),
-                     "trial": result["trial"], "jobs": result["value"], "last_n": result["last_n"],
-                     "total_steps": result["total_steps"], "eval_freq": result["eval_freq"]})
-    columns = ["algorithm", "scope", "study", "rewards", "k_values", "trial", "jobs",
+        for path in sorted((output / folder).rglob("best_params.json")):
+            result = json.loads(path.read_text(encoding="utf-8"))
+            if result.get("schema") != 4:
+                continue
+            rows.append({"algorithm": result["algorithm"], "scope": scope, "study": result["study"],
+                         "directory": str(path.parent.relative_to(output)),
+                         "rewards": ", ".join(result["rewards"]),
+                         "k_values": ",".join(map(str, result["k_values"])),
+                         "trial": result["trial"], "jobs": result["value"], "last_n": result["last_n"],
+                         "total_steps": result["total_steps"], "eval_freq": result["eval_freq"]})
+    columns = ["algorithm", "scope", "study", "directory", "rewards", "k_values", "trial", "jobs",
                "last_n", "total_steps", "eval_freq"]
     pd.DataFrame(rows, columns=columns).to_csv(output / "summary.csv", index=False)
 
@@ -474,15 +543,12 @@ def main():
     print(dataset)
     if len(dataset.courses) != args.nb_courses or len(dataset.jobs) != args.nb_jobs:
         raise ValueError("Loaded dataset sizes differ from --nb-courses / --nb-jobs.")
-    details = dataset_details(dataset)
     seeds = {k: list(args.seeds) for k in args.k_values}
+    selection = {"algorithms": sorted(args.algorithms), "rewards": sorted(args.rewards),
+                 "k_values": sorted(args.k_values)}
     for algorithm in args.algorithms:
         output = args.output / algorithm / args.scope
         output.mkdir(parents=True, exist_ok=True)
-        path = output / "dataset.json"
-        if path.is_file() and json.loads(path.read_text(encoding="utf-8")) != details:
-            raise ValueError("Dataset changed. Use a new --output.")
-        write_json(path, details)
         print(f"Algorithm: {algorithm}; scope: {args.scope}; output: {output}")
         for folder, pairs in make_groups(args.rewards, args.k_values, args.scope):
             configs = []
@@ -492,7 +558,8 @@ def main():
                 base.update(model=ALGORITHMS[algorithm], name_exp=reward, k=k, seed=seeds[k][0])
                 configs.append(base)
             tuner = ReinforceTuner(configs, dataset, output / folder, seeds, algorithm, args.scope,
-                                   args.trials, args.last_n, args.sampler_seed, args.pruning)
+                                   args.trials, args.last_n, args.sampler_seed, args.pruning,
+                                   selection=selection)
             result = tuner.tune()
             if result is not None:
                 print(f"[BEST] {result['study']}: {result['value']:.4f} applicable jobs.")
